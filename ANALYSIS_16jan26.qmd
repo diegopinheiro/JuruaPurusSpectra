@@ -1,0 +1,337 @@
+---
+title: "Analise_3"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+library(dplyr) # manipulation / tables
+library(stringr) # text handling
+library(readr)  # read/write CSV
+library(tidyr)  #  pivot/reshaping
+library(purrr)  # maps, lists
+library(ggplot2) # graphs
+library(tibble) # tables handling
+
+# ==============
+# AJUSTE AS PASTAS
+# ==============
+
+dir_tables <- "C:/PRISMA/Tabelas"
+dir_asd    <- "C:/PRISMA/Tabelas/Reflectancia"
+out_dir <- file.path(dir_tables, "outputs_csv")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+dir_tables
+dir_asd
+out_dir
+```
+
+## Chunck 1
+
+```{r}
+# ------------------------------------------------------------
+# Load PRISMA long table + define img_solo
+# ------------------------------------------------------------
+
+img <- readr::read_csv(
+  file.path(dir_tables, "PRISMA_image_profiles_BOA_ITA_IPX_long_filtered.csv"),
+  show_col_types = FALSE
+)
+
+img_solo <- img |>
+  dplyr::filter(TIPO == "SOLO")
+
+# checagem rápida
+stopifnot(all(c("PONTO","wl_nm") %in% names(img_solo)))
+
+names(img)
+
+```
+
+## Chunck 2
+
+```{r}
+# ------------------------------------------------------------
+# B) DEFINE img_solo / img_water (robusto)
+# ------------------------------------------------------------
+img <- img |>
+  dplyr::mutate(
+    TIPO = trimws(TIPO),
+    sample_key = gsub("_", "", PONTO),
+    wl_key = round(wl_nm, 3)
+  )
+
+img_solo <- img |>
+  dplyr::filter(TIPO == "SOLO") |>
+  dplyr::filter(is.finite(refl_img))
+
+img_water <- img |>
+  dplyr::filter(TIPO == "AGUA") |>
+  dplyr::filter(is.finite(refl_img))
+
+# checagens
+img_solo |> dplyr::count(SITE)
+img_water |> dplyr::count(SITE)
+
+```
+
+## Chunck 3
+
+```{r}
+# ------------------------------------------------------------
+# C) METRICS HELPERS
+# ------------------------------------------------------------
+
+safe_cor <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < 3) return(NA_real_)
+  suppressWarnings(stats::cor(x[ok], y[ok], method = "pearson"))
+}
+
+rmse <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) == 0) return(NA_real_)
+  sqrt(mean((x[ok] - y[ok])^2))
+}
+
+sam_deg <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) == 0) return(NA_real_)
+  x <- x[ok]; y <- y[ok]
+  num <- sum(x*y)
+  den <- sqrt(sum(x^2)) * sqrt(sum(y^2))
+  if (!is.finite(num/den) || den == 0) return(NA_real_)
+  acos(pmin(pmax(num/den, -1), 1)) * 180/pi
+}
+
+```
+
+## Chunck 3C
+
+```{r}
+# ------------------------------------------------------------
+# C4) FieldSpec (*.asd.txt) -> fs_long -> mean spectrum -> fs_resampled
+# (NORMALIZA sample_key para casar com PRISMA)
+# ------------------------------------------------------------
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tibble)
+
+asd_files <- list.files(dir_asd, pattern = "\\.asd\\.txt$", full.names = TRUE)
+
+read_asd_txt <- function(f) {
+  lines <- readLines(f, warn = FALSE)
+
+  is_numline <- function(x) {
+    nums <- str_extract_all(x, "[-+]?[0-9]*\\.?[0-9]+(?:[eE][-+]?[0-9]+)?")[[1]]
+    length(nums) >= 2
+  }
+
+  i0 <- which(vapply(lines, is_numline, logical(1)))[1]
+  if (is.na(i0)) stop("Não encontrei bloco numérico no arquivo: ", basename(f))
+
+  dat <- read.table(text = lines[i0:length(lines)], header = FALSE)
+  dat <- dat[, 1:2]
+  colnames(dat) <- c("wl_nm", "refl_raw")
+
+  fname <- basename(f)
+  base  <- str_replace(fname, "\\.asd\\.txt$", "")  # BA_00100007
+
+  # extrai BA_001 / PX_002 / TA_001
+  ponto_short <- str_extract(base, "^[A-Z]{2}_[0-9]{3}")
+  if (is.na(ponto_short)) return(NULL)  # evita NA no sample_key
+
+  # mapeia prefixos para seus sites
+  ponto_short <- ponto_short |>
+    str_replace("^PX_", "IPX_") |>
+    str_replace("^TA_", "ITA_")
+
+  # NORMALIZA removendo underscore -> BA001 / ITA001 / IPX003
+  sample_key <- gsub("_", "", ponto_short)
+
+  tibble(
+    sample_key = sample_key,
+    wl_nm      = as.numeric(dat$wl_nm),
+    refl_raw   = as.numeric(dat$refl_raw)
+  )
+}
+
+fs_long <- map_dfr(asd_files, read_asd_txt)
+
+# média das replicatas por ponto
+fs_mean <- fs_long %>%
+  group_by(sample_key, wl_nm) %>%
+  summarise(refl_mean = mean(refl_raw, na.rm = TRUE), .groups = "drop")
+
+# bandas PRISMA (alvo)
+prisma_bands <- img_solo %>%
+  distinct(wl_nm) %>%
+  arrange(wl_nm) %>%
+  pull(wl_nm)
+
+# resample (interp linear)
+fs_resampled <- fs_mean %>%
+  group_by(sample_key) %>%
+  group_modify(~{
+    x <- .x$wl_nm
+    y <- .x$refl_mean
+
+    ord <- order(x)
+    x <- x[ord]; y <- y[ord]
+    keep <- !duplicated(x)
+    x <- x[keep]; y <- y[keep]
+
+    y_out <- approx(x = x, y = y, xout = prisma_bands, rule = 2)$y
+
+    tibble(wl_nm = prisma_bands, refl_fs = y_out)
+  }) %>%
+  ungroup() %>%
+  mutate(wl_key = round(wl_nm, 3))
+
+# checagem FINAL: agora deve bater
+setdiff(unique(img_solo$sample_key), unique(fs_resampled$sample_key))
+setdiff(unique(fs_resampled$sample_key), unique(img_solo$sample_key))
+
+```
+
+## Chunck 4
+
+```{r}
+# ------------------------------------------------------------
+# D) STANDARDIZE fs_resampled FOR JOIN
+# ------------------------------------------------------------
+if (!exists("fs_resampled")) {
+  stop("fs_resampled não existe. Rode antes o chunk que gera o FieldSpec resampled.")
+}
+
+# acha automaticamente a coluna de reflectância do FieldSpec
+cand <- c("refl_fs","ref1_fs","reflectance","refl","r")
+col_fs <- cand[cand %in% names(fs_resampled)][1]
+
+if (is.na(col_fs)) {
+  stop("Não encontrei a coluna de reflectância em fs_resampled. Rode: names(fs_resampled)")
+}
+
+# cria colunas padrão
+fs_resampled <- fs_resampled |>
+  dplyr::mutate(
+    refl_fs = .data[[col_fs]],
+    wl_key  = round(wl_nm, 3)
+  )
+
+# garantir sample_key
+if (!("sample_key" %in% names(fs_resampled))) {
+  if ("PONTO" %in% names(fs_resampled)) {
+    fs_resampled <- fs_resampled |> mutate(sample_key = PONTO)
+  } else if ("ponto" %in% names(fs_resampled)) {
+    fs_resampled <- fs_resampled |> mutate(sample_key = ponto)
+  } else {
+    stop("fs_resampled não tem sample_key nem PONTO. Veja names(fs_resampled).")
+  }
+}
+
+stopifnot(all(c("sample_key","wl_key","wl_nm","refl_fs") %in% names(fs_resampled)))
+
+```
+
+## Chunck 5
+
+```{r}
+# ------------------------------------------------------------
+# E) RESULT TABLE — Table I (SOIL)
+# ------------------------------------------------------------
+
+res_solo <- img_solo |>
+  dplyr::inner_join(fs_resampled, by = c("sample_key", "wl_key")) |>
+  dplyr::group_by(SITE, PONTO, sample_key) |>
+  dplyr::summarise(
+    n_wl    = sum(is.finite(refl_img) & is.finite(refl_fs)),
+    SAM_deg = sam_deg(refl_img, refl_fs),
+    RMSE    = rmse(refl_img, refl_fs),
+    CORR    = safe_cor(refl_img, refl_fs),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(SITE, SAM_deg)
+
+readr::write_csv(res_solo, file.path(out_dir, "TableI_SOLO_SAM_RMSE_CORR.csv"))
+res_solo
+
+```
+
+## Chunck 6
+
+```{r}
+- ------------------------------------------------------------
+# REBUILD img_solo CLEANLY (ALL SITES) + PLOTS BY SITE
+# ------------------------------------------------------------
+
+oil spectra comparison: PRISMA vs FieldSpec (resampled
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# 1) reconstruir img_solo SEM filtrar bbl
+img_solo <- img |>
+  mutate(
+    TIPO = trimws(TIPO),
+    sample_key = gsub("_", "", PONTO),
+    wl_key = round(wl_nm, 3)
+  ) |>
+  filter(TIPO == "SOLO") |>
+  filter(is.finite(refl_img))
+
+# checagem: agora tem os 3 municípios
+img_solo |> count(SITE)
+
+# 2) join SOLO PRISMA x FieldSpec (resampled)
+solo_join <- img_solo |>
+  inner_join(fs_resampled, by = c("sample_key", "wl_key")) |>
+  mutate(wl_nm = wl_nm.x)
+
+solo_join |> count(SITE)
+
+# 3) gerar 1 gráfico por município (SITE)
+for (s in unique(solo_join$SITE)) {
+
+  df_site <- solo_join |>
+    filter(SITE == s) |>
+    select(SITE, PONTO, wl_nm, refl_img, refl_fs) |>
+    pivot_longer(cols = c(refl_img, refl_fs),
+                 names_to = "source",
+                 values_to = "refl") |>
+    mutate(source = recode(source,
+                           refl_img = "PRISMA",
+                           refl_fs  = "FieldSpec (resampled)"))
+
+  if (nrow(df_site) == 0) next
+
+  p <- ggplot(df_site, aes(wl_nm, refl, linetype = source)) +
+    geom_line() +
+    facet_wrap(~PONTO, scales = "free_y", ncol = 2) +
+    theme_minimal() +
+    labs(title = paste0("Soil spectra comparison: PRISMA vs FieldSpec (resampled)", s),
+         x = "Wavelength (nm)",
+         y = "Reflectance",
+         linetype = "Source")
+
+  ggsave(file.path(out_dir, paste0("Fig_SOLO_", s, ".png")),
+         p, width = 14, height = 10, dpi = 220)
+
+  print(p)
+}
+```
