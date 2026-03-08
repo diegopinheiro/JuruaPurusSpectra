@@ -73,7 +73,4 @@ The workflow includes:
 ```text
 JuruaPurusSpectra/
 ├── data/
-├── scripts/
-├── figures/
-├── outputs/
 └── README.md
